@@ -186,11 +186,23 @@ docker exec -it airflow-scheduler airflow dags list-runs -d datamart_etl_pipelin
 
 ---
 
-## Diseño del Data Warehouse (Star Schema)
+## Esquema de Constelación de Hechos (Fact Constellation / Multi-Star Schema)
 
-El repositorio analítico se modeló bajo la metodología dimensional de **Ralph Kimball**, garantizando alto rendimiento para consultas analíticas y desacoplamiento de dimensiones.
+<img width="1322" height="726" alt="Captura de pantalla 2026-10-27 090222" src="https://github.com/user-attachments/assets/63f7793e-573e-48b8-b0d0-09f0481dd232" />
 
+### ¿Por qué NO es un Copo de Nieve (Snowflake)?
+No es un copo de nieve porque las dimensiones (dim_products, dim_customers, dim_date) no están divididas en subtablas. Siguen siendo dimensiones planas y desnormalizadas típicas de una estrella.
+### Constelación de Hechos 
+Son dos estrellas que comparten las mismas dimensiones (lo que Kimball llama "Dimensiones Conformes" o Conformed Dimensions):
+- Ambas tablas de hechos consultan exactamente a las mismas 3 dimensiones:
 
+1. Un producto se vende (fact_sales) y el mismo producto se devuelve (fact_returns).
+2. Un cliente compra (fact_sales) y el mismo cliente pide reembolso (fact_returns).
+3. Ambos eventos ocurren en una fecha de dim_date.
+
+### Si hubiéramos forzado una sola tabla de hechos:
+- Habríamos tenido que mezclar números positivos y negativos, violando la regla de negocio que prohíbe mezclar devoluciones con ventas.
+- Si un analista de BI hiciera un COUNT(*) o un promedio de ventas, las devoluciones falsearían el volumen real transaccionado.
 ---
 
 ## Documento de Decisiones Técnicas y Ambigüedades
