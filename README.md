@@ -132,7 +132,7 @@ Para ejecutar el pipeline completo en producción o evaluación, **Docker gestio
 
 ### 1. Clonar el repositorio
 ```bash
-git clone <URL_DE_TU_REPOSITORIO>
+git clone https://github.com/millussion/prueba-DataMart.git
 cd prueba-DataMart
 ```
 
