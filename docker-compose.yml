@@ -1,0 +1,130 @@
+version: '3.8'
+
+x-airflow-common: &airflow-common
+  image: apache/airflow:2.8.1-python3.10
+  environment:
+    &airflow-common-env
+    AIRFLOW__CORE__EXECUTOR: LocalExecutor
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
+    AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
+    AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
+    
+    # Inyección de dependencias necesarias sin compilar Dockerfile
+    _PIP_ADDITIONAL_REQUIREMENTS: "pandas pyarrow psycopg2-binary"
+
+    # Conexión automática al DWH PostgreSQL
+    AIRFLOW_CONN_POSTGRES_DWH: postgresql+psycopg2://${DWH_POSTGRES_USER}:${DWH_POSTGRES_PASSWORD}@dwh-postgres:5432/${DWH_POSTGRES_DB}
+    
+    # Variables de Airflow (incluyendo la URL interna de la API FastAPI)
+    AIRFLOW_VAR_RAW_DATA_PATH: /opt/airflow/data
+    AIRFLOW_VAR_PRODUCT_API_URL: http://product-api:8000
+    AIRFLOW_VAR_BATCH_CHUNK_SIZE: 10000
+
+  volumes:
+    - ./dags:/opt/airflow/dags
+    - ./data:/opt/airflow/data
+    - ./sql:/opt/airflow/sql
+    - ./airflow_logs:/opt/airflow/logs
+  user: "${AIRFLOW_UID:-50000}:0"
+  depends_on:
+    airflow-postgres:
+      condition: service_healthy
+
+services:
+  # 1. Base de datos de Airflow (Metadatos)
+  airflow-postgres:
+    image: postgres:15-alpine
+    container_name: airflow-postgres
+    environment:
+      POSTGRES_USER: ${AIRFLOW_DB_USER}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+    volumes:
+      - airflow-db-volume:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER}", "-d", "${AIRFLOW_DB_NAME}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # 2. Base de datos del Data Warehouse Analítico
+  dwh-postgres:
+    image: postgres:15-alpine
+    container_name: dwh-postgres
+    environment:
+      POSTGRES_USER: ${DWH_POSTGRES_USER}
+      POSTGRES_PASSWORD: ${DWH_POSTGRES_PASSWORD}
+      POSTGRES_DB: ${DWH_POSTGRES_DB}
+    ports:
+      - "${DWH_POSTGRES_PORT}:5432"
+    volumes:
+      - dwh-db-volume:/var/lib/postgresql/data
+      - ./sql/01_init_dwh.sql:/docker-entrypoint-initdb.d/01_init_dwh.sql
+    healthcheck:
+      test: ["CMD", "pg_isready", "-U", "${DWH_POSTGRES_USER}", "-d", "${DWH_POSTGRES_DB}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: always
+
+  # 3. Microservicio API de Catálogo Legado (FastAPI)
+  product-api:
+    image: prueba-datamart-product-api:latest
+    container_name: datamart-product-api
+    ports:
+      - "${PRODUCT_API_PORT:-8000}:8000"
+    volumes:
+      - ./api/main.py:/app/main.py
+      - ./data:/data:ro
+    restart: always
+
+  # 4. Inicializador de Airflow (Migraciones y usuario admin)
+  airflow-init:
+    <<: *airflow-common
+    container_name: airflow-init
+    entrypoint: /bin/bash
+    command:
+      - -c
+      - |
+        airflow db migrate
+        airflow users create \
+          --username "${_AIRFLOW_WWW_USER_USERNAME}" \
+          --firstname DataMart \
+          --lastname Admin \
+          --role Admin \
+          --email admin@datamart.com \
+          --password "${_AIRFLOW_WWW_USER_PASSWORD}" || true
+    restart: on-failure
+
+  # 5. Webserver de Airflow
+  airflow-webserver:
+    <<: *airflow-common
+    container_name: airflow-webserver
+    command: webserver
+    ports:
+      - "8080:8080"
+    healthcheck:
+      test: ["CMD", "curl", "--fail", "http://localhost:8080/health"]
+      interval: 15s
+      timeout: 10s
+      retries: 5
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+  # 6. Scheduler de Airflow
+  airflow-scheduler:
+    <<: *airflow-common
+    container_name: airflow-scheduler
+    command: scheduler
+    restart: always
+    depends_on:
+      airflow-init:
+        condition: service_completed_successfully
+
+volumes:
+  airflow-db-volume:
+  dwh-db-volume:
