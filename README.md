@@ -8,13 +8,15 @@ Solución integral de ingeniería de datos de extremo a extremo para **DataMart 
 1. [Contexto del Negocio y Objetivos](#contexto-del-negocio-y-objetivos)
 2. [Arquitectura del Sistema](#arquitectura-del-sistema)
 3. [Estructura del Proyecto](#-estructura-del-proyecto)
-4. [Instalación del Entorno Local con uv (Desarrollo y VS Code)](#instalación-del-entorno-local-con-uv-desarrollo-y-vs-code)
-5. [Guía Rápida de Despliegue con Docker (< 5 minutos)](#guía-rápida-de-despliegue-con-docker--5-minutos)
-6. [Validación Automática de Connections y Variables](#validación-automática-de-connections-y-variables)
-7. [Ejecución del Pipeline ETL](#ejecución-del-pipeline-etl)
-8. [Esquema de Constelación de Hechos (Fact Constellation / Multi-Star Schema)](#esquema-de-constelación-de-hechos-fact-constellation--multi-star-schema)
-9. [Documento de Decisiones Técnicas y Ambigüedades](#documento-de-decisiones-técnicas-y-ambigüedades)
-10. [Comandos de Mantenimiento](#-comandos-de-mantenimiento)
+4. [Ejecución Automatizada con run_pipeline.ps1](#ejecución-automatizada-con-run_pipelineps1)
+5. [Instalación del Entorno Local con uv (Desarrollo y VS Code)](#instalación-del-entorno-local-con-uv-desarrollo-y-vs-code)
+6. [Guía Rápida de Despliegue con Docker (< 5 minutos)](#guía-rápida-de-despliegue-con-docker--5-minutos)
+7. [Validación Automática de Connections y Variables](#validación-automática-de-connections-y-variables)
+8. [Ejecución del Pipeline ETL](#ejecución-del-pipeline-etl)
+9. [Paso a paso para conectar DBeaver](#paso-a-paso-para-conectar-dbeaver)
+10. [Esquema de Constelación de Hechos (Fact Constellation / Multi-Star Schema)](#esquema-de-constelación-de-hechos-fact-constellation--multi-star-schema)
+11. [Documento de Decisiones Técnicas y Ambigüedades](#documento-de-decisiones-técnicas-y-ambigüedades)
+12. [Comandos de Mantenimiento](#-comandos-de-mantenimiento)
 ---
 
 ## Contexto del Negocio y Objetivos
@@ -71,6 +73,7 @@ prueba-DataMart/
 ├── .env                       # Variables de entorno activas (excluido en .gitignore)
 ├── .gitignore                 # Reglas de exclusión para Git
 ├── docker-compose.yml         # Orquestación de todos los contenedores
+├── run_pipeline.ps1           # Script de automatización en un solo paso
 ├── README.md                  # Documentación maestra y guía de entrega
 ├── DECISIONS.md               # Documento de decisiones técnicas
 ├── api/                       # Microservicio FastAPI
@@ -87,12 +90,29 @@ prueba-DataMart/
 ```
 
 ---
-## Ejecución
-En Windows PowerShell, desde la raíz del proyecto:
 
+## Ejecución Automatizada con `run_pipeline.ps1`
+
+Para ejecutar todo el pipeline de punta a punta de forma automática:
+
+### 1. Crear el archivo `.env`
+Copia la plantilla `.env.example` para inicializar tus variables de entorno:
+```powershell
+# En Windows PowerShell:
+copy .env.example .env
+
+# En Linux/macOS:
+cp .env.example .env
+```
+
+### 2. Ejecutar el script automatizado
+En Windows PowerShell, desde la raíz del proyecto:
 ```powershell
 .\run_pipeline.ps1
 ```
+*(Si PowerShell te pide permisos de ejecución, corre: `powershell -ExecutionPolicy Bypass -File .\run_pipeline.ps1`)*
+
+---
 
 ## Instalación del Entorno Local con `uv` (Desarrollo y VS Code)
 
@@ -189,6 +209,28 @@ docker exec -it airflow-scheduler airflow dags trigger datamart_etl_pipeline
 # 3. Monitorear estado de las tareas
 docker exec -it airflow-scheduler airflow dags list-runs -d datamart_etl_pipeline
 ```
+
+---
+
+## Paso a paso para conectar DBeaver:
+
+1. Abre **DBeaver**.
+2. En la barra superior, haz clic en el ícono del enchufe con el signo más (**+**) o ve a **Base de datos > Nueva conexión**.
+3. Selecciona **PostgreSQL** y haz clic en **Siguiente**.
+4. Llena los campos con estos datos exactos de tu configuración:
+
+| Campo | Valor |
+| :--- | :--- |
+| **Host** | `localhost` |
+| **Puerto (Port)** | `5433` (¡Ojo! Es 5433, no 5432) |
+| **Database** | `datamart_dwh` |
+| **Username** | `dwh_user` |
+| **Password** | `dwh_secure_password_2024` |
+
+5. Haz clic en el botón **Probar conexión (Test Connection)**:
+   - *(Si DBeaver te pide descargar el controlador de PostgreSQL, dale clic a "Descargar" y tardará 2 segundos).*
+   - Te saldrá un mensaje en verde de conexión exitosa.
+6. Haz clic en **Finalizar (Finish)**.
 
 ---
 
