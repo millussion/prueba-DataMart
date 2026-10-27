@@ -5,16 +5,16 @@ Solución integral de ingeniería de datos de extremo a extremo para **DataMart 
 ---
 
 ## Tabla de Contenidos
-1. [Contexto del Negocio y Objetivos](#-contexto-del-negocio-y-objetivos)
-2. [Arquitectura del Sistema](#-arquitectura-del-sistema)
+1. [Contexto del Negocio y Objetivos](#contexto-del-negocio-y-objetivos)
+2. [Arquitectura del Sistema](#arquitectura-del-sistema)
 3. [Estructura del Proyecto](#-estructura-del-proyecto)
-4. [Guía Rápida de Despliegue con Docker (< 5 minutos)](#-guía-rápida-de-despliegue-con-docker--5-minutos)
-5. [Instalación del Entorno Local con uv (Desarrollo y VS Code)](#-instalación-del-entorno-local-con-uv-desarrollo-y-vs-code)
-6. [Validación de Servicios, Conexiones y Variables](#-validación-de-servicios-conexiones-y-variables)
-7. [Diseño del Data Warehouse (Star Schema)](#-diseño-del-data-warehouse-star-schema)
-8. [Documento de Decisiones Técnicas y Ambigüedades](#-documento-de-decisiones-técnicas-y-ambigüedades)
-9. [Comandos de Mantenimiento](#-comandos-de-mantenimiento)
-
+4. [Instalación del Entorno Local con uv (Desarrollo y VS Code)](#instalación-del-entorno-local-con-uv-desarrollo-y-vs-code)
+5. [Guía Rápida de Despliegue con Docker (< 5 minutos)](#guía-rápida-de-despliegue-con-docker--5-minutos)
+6. [Validación Automática de Connections y Variables](#validación-automática-de-connections-y-variables)
+7. [Ejecución del Pipeline ETL](#ejecución-del-pipeline-etl)
+8. [Esquema de Constelación de Hechos (Fact Constellation / Multi-Star Schema)](#esquema-de-constelación-de-hechos-fact-constellation--multi-star-schema)
+9. [Documento de Decisiones Técnicas y Ambigüedades](#documento-de-decisiones-técnicas-y-ambigüedades)
+10. [Comandos de Mantenimiento](#-comandos-de-mantenimiento)
 ---
 
 ## Contexto del Negocio y Objetivos
