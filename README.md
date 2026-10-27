@@ -14,9 +14,10 @@ Solución integral de ingeniería de datos de extremo a extremo para **DataMart 
 7. [Validación Automática de Connections y Variables](#validación-automática-de-connections-y-variables)
 8. [Ejecución del Pipeline ETL](#ejecución-del-pipeline-etl)
 9. [Paso a paso para conectar DBeaver](#paso-a-paso-para-conectar-dbeaver)
-10. [Esquema de Constelación de Hechos (Fact Constellation / Multi-Star Schema)](#esquema-de-constelación-de-hechos-fact-constellation--multi-star-schema)
-11. [Documento de Decisiones Técnicas y Ambigüedades](#documento-de-decisiones-técnicas-y-ambigüedades)
-12. [Comandos de Mantenimiento](#-comandos-de-mantenimiento)
+10. [Paso a paso para conectar pgAdmin](#paso-a-paso-para-conectar-pgadmin)
+11. [Esquema de Constelación de Hechos (Fact Constellation / Multi-Star Schema)](#esquema-de-constelación-de-hechos-fact-constellation--multi-star-schema)
+12. [Documento de Decisiones Técnicas y Ambigüedades](#documento-de-decisiones-técnicas-y-ambigüedades)
+13. [Comandos de Mantenimiento](#-comandos-de-mantenimiento)
 ---
 
 ## Contexto del Negocio y Objetivos
@@ -231,6 +232,22 @@ docker exec -it airflow-scheduler airflow dags list-runs -d datamart_etl_pipelin
    - *(Si DBeaver te pide descargar el controlador de PostgreSQL, dale clic a "Descargar" y tardará 2 segundos).*
    - Te saldrá un mensaje en verde de conexión exitosa.
 6. Haz clic en **Finalizar (Finish)**.
+
+---
+
+## Paso a paso para conectar pgAdmin
+
+Si usas **pgAdmin** en lugar de DBeaver:
+
+1. Clic derecho en **Servers** > **Register** > **Server...**
+2. En la pestaña **General**, ponle un nombre (ej. `DataMart DWH`).
+3. En la pestaña **Connection**, llena los datos:
+   - **Host name/address:** `localhost`
+   - **Port:** `5433` (recuerda que el 5432 es de Airflow)
+   - **Maintenance database:** `datamart_dwh`
+   - **Username:** `dwh_user`
+   - **Password:** `dwh_secure_password_2024`
+4. Haz clic en **Save**.
 
 ---
 
