@@ -1,21 +1,10 @@
-## Respuestas y Consultas SQL de Negocio de la Sección 7 de la prueba.
+## Respuestas y Consultas SQL de Negocio de la Sección 7 de la prueba
 
-Para ejecutar todas las consultas en PostgreSQL:
+Para ejecutar todas las consultas consolidadas contra PostgreSQL DWH:
 ```bash
 Get-Content ./sql/02_business_questions.sql | docker exec -i dwh-postgres psql -U dwh_user -d datamart_dwh
 ```
 *(En Linux/macOS: `cat ./sql/02_business_questions.sql | docker exec -i dwh-postgres psql -U dwh_user -d datamart_dwh`)*
-
-### Resumen General Obtenido en el DWH:
-```text
-          tabla           | total_registros | total_dinero 
---------------------------+-----------------+--------------
- 1. Ventas Válidas        |          522602 |  62781386.54
- 2. Devoluciones          |            8548 |   2664628.15
- 3. Rechazados (Calidad)  |               0 |            0
- 4. Productos en Catálogo |            3768 |            0
- 5. Clientes Únicos       |            4739 |            0
-```
 
 ---
 
@@ -41,7 +30,9 @@ FROM sales_monthly sm
 FULL OUTER JOIN returns_monthly rm ON sm.periodo = rm.periodo
 ORDER BY periodo ASC;
 ```
-* **Resultado del Análisis**: Ventas mensuales promedio de **$4.5M**, alcanzando su punto máximo en el último trimestre de 2019 (Septiembre: **$6.5M**, Octubre: **$6.9M**, Noviembre: **$7.7M** impulsado por estacionalidad de fin de año).
+* **Resultado del Análisis**: El pipeline procesó exitosamente **26 meses de historia transaccional** consolidando ambas fuentes:
+  - **Periodo 2010–2011 (`data.csv`)**: Ventas netas estables entre **$500K y $1.0M** mensuales, con un fuerte pico estacional en Noviembre de 2011 alcanzando **$1.45M**.
+  - **Periodo 2018–2019 (`Sales Transaction v.4a.csv`)**: El negocio escala a un promedio de **$4.5M** mensuales, registrando su máximo histórico en Noviembre de 2019 con **$7.71M** en ventas netas por temporada alta de fin de año.
 
 ---
 
@@ -66,11 +57,15 @@ FROM cat_sales s
 LEFT JOIN cat_returns r ON s.category = r.category
 ORDER BY s.gross_revenue DESC;
 ```
-* **Resultado del Análisis**: La categoría **Hogar** concentra la mayor facturación (**$62.5M**) con una tasa de devolución controlada del **4.26%**. La categoría **Papelería** presenta la mayor proporción de devoluciones con un **7.49%**.
+* **Resultado del Análisis**:
+  - **Líder en Facturación**: **Hogar** es la categoría principal con **$53.58M** brutos ($51.99M netos) y una tasa de devolución baja y controlada del **2.97%**.
+  - **Mayor Proporción de Devoluciones**: **Electrónica** presenta la tasa más crítica con un **17.94%** de devoluciones ($1.00M devuelto), seguida por **Ropa** con un **14.03%** ($760K devuelto), lo que exige una revisión técnica de calidad y tallajes.
 
 ---
+
 ### Pregunta 3: ¿Cuáles son los 10 productos con mayor revenue neto y cuáles son los 10 con mayor tasa de devolución?
-### Pregunta 3.1: Top 10 productos con mayor revenue neto
+
+#### Pregunta 3.1: Top 10 productos con mayor revenue neto
 ```sql
 WITH prod_sales AS (
     SELECT product_key, SUM(gross_revenue) AS gross_rev FROM fact_sales GROUP BY product_key
@@ -87,11 +82,13 @@ LEFT JOIN prod_sales s ON p.product_key = s.product_key
 LEFT JOIN prod_returns r ON p.product_key = r.product_key
 ORDER BY revenue_neto DESC LIMIT 10;
 ```
-* **Top 1**: `22197` (*POPCORN HOLDER*) con **$583.075,23** en ventas netas.
+* **Top 1**: `22197` (*POPCORN HOLDER*) con **$634.043,15** en ventas netas.
+* **Top 2**: `84077` (*WORLD WAR 2 GLIDERS ASSTD DESIGNS*) con **$569.717,72**.
+* **Top 3**: `85123A` (*CREAM HANGING HEART T-LIGHT HOLDER*) con **$550.954,66**.
+* **Top 4**: `23843` (*PAPER CRAFT , LITTLE BIRDIE*) con **$501.359,05**.
+* **Top 5**: `84879` (*ASSORTED COLOUR BIRD ORNAMENT*) con **$478.350,10**.
 
----
-
-### Pregunta 3.2: Top 10 productos con mayor tasa de devolución (> 50 unidades vendidas)
+#### Pregunta 3.2: Top 10 productos con mayor tasa de devolución (> 50 unidades vendidas)
 ```sql
 WITH prod_sales AS (
     SELECT product_key, SUM(quantity) AS units_sold, SUM(gross_revenue) AS gross_rev FROM fact_sales GROUP BY product_key
@@ -108,7 +105,8 @@ LEFT JOIN prod_returns r ON p.product_key = r.product_key
 WHERE s.units_sold >= 50
 ORDER BY tasa_devolucion_pct DESC LIMIT 10;
 ```
-* **Caso Crítico**: El producto `23166` (*MEDIUM CERAMIC TOP STORAGE JAR*) vendió 78.033 unidades y devolvió 74.494 unidades (**95.61% de devolución**).
+* **Caso Crítico Absoluto**: El producto `23166` (*MEDIUM CERAMIC TOP STORAGE JAR*) vendió 156.066 unidades y devolvió 148.988 unidades (**95.54% de tasa de devolución**).
+* **Devolución Total (100%)**: El producto `21655` (*HANGING RIDGE GLASS T-LIGHT HOLDER*) devolvió exactamente las 72 unidades vendidas.
 
 ---
 
@@ -122,11 +120,12 @@ FROM fact_sales
 GROUP BY country
 ORDER BY total_ordenes DESC LIMIT 10;
 ```
-* **Resultado del Análisis**: **United Kingdom** concentra 17.908 órdenes ($2.923 de ticket promedio). Mercados como **Netherlands** ($22.888) y **Australia** ($16.055) muestran un ticket promedio significativamente superior debido a compras por volumen B2B.
+* **Concentración del Mercado**: **United Kingdom** concentra el 88% de las transacciones con **18.113 órdenes**, totalizando **$61.35M** con un ticket promedio de **$3.386,96**.
+* **Segmento Corporativo / B2B**: Países como **Netherlands** ($25.652,63 de ticket promedio) y **Australia** ($17.997,90) presentan tickets significativamente más elevados debido a órdenes de distribución mayorista.
 
 ---
 
-### Pregunta 5:  ¿Existe alguna diferencia en el comportamiento de compra entre clientes identificados y transacciones sin customer ID? (Esta pregunta solo aplica si decidiste incluir las transacciones sin cliente.)
+### Pregunta 5: ¿Existe alguna diferencia en el comportamiento de compra entre clientes identificados y transacciones sin customer ID? (Esta pregunta solo aplica si decidiste incluir las transacciones sin cliente.)
 ```sql
 SELECT c.customer_type,
        COUNT(DISTINCT s.invoice_no) AS total_ordenes,
@@ -138,7 +137,11 @@ FROM fact_sales s
 JOIN dim_customers c ON s.customer_key = c.customer_key
 GROUP BY c.customer_type;
 ```
-* **Resultado del Análisis**: Los clientes registrados (`REGISTRADO`) representan el 99.9% de los ingresos ($62.7M) con un ticket promedio de **$3.172,54**.
+* **Resultado del Análisis y Justificación**:
+  - **Decisión de inclusión**: **SÍ se incluyeron** bajo la clasificación `'INVITADO'`. Descartarlas habría eliminado **$1.754.983,91** en ventas legítimas de la contabilidad de la empresa.
+  - **Diferencia de Comportamiento**:
+    - **Clientes Invitados (`INVITADO`)**: Generaron **1.429 órdenes** con **420.426 unidades** vendidas y un ticket promedio de **$1.228,12**, reflejando compras minoristas individuales sin registro.
+    - **Clientes Registrados (`REGISTRADO`)**: Generaron **19.923 órdenes** con **$71.667.957,68** en ventas y un ticket promedio casi tres veces superior (**$3.597,25**), correspondiente a compradores frecuentes y cuentas comerciales B2B.
 
 ---
 
@@ -146,7 +149,7 @@ GROUP BY c.customer_type;
 ```sql
 SELECT COUNT(DISTINCT stock_code) AS total_codigos_unicos FROM dim_products;
 ```
-* **Resultado**: **3.768** referencias únicas activas en el catálogo.
+* **Resultado**: **3.944 referencias únicas** catalogadas, normalizadas y activas en `dim_products` (cumpliendo con el contexto de negocio de más de 3.000 referencias).
 
 ---
 
@@ -162,8 +165,7 @@ JOIN (SELECT product_key, SUM(refund_amount) AS return_amt FROM fact_returns GRO
 WHERE s.gross_rev > 5000 AND (r.return_amt / s.gross_rev) >= 0.15
 ORDER BY r.return_amt DESC LIMIT 10;
 ```
-* **Recomendación Respaldada por números**:
-  1. **Suspensión Inmediata de `23166`**: Este producto (*MEDIUM CERAMIC TOP STORAGE JAR*) generó una pérdida directa de **$843.277,96** por devoluciones (tasa del 95.61%). Al ser un frasco de cerámica, la causa raíz apunta a roturas durante el transporte. Se debe exigir embalaje reforzado o retirar la referencia del catálogo.
-  2. **Revisión de `23843` (*PAPER CRAFT LITTLE BIRDIE*)**: Aunque generó $1M bruto, tuvo una devolución de **$501.359,05** (50% exacto), indicando cancelaciones masivas de lotes corporativos.
-
----
+* **Recomendaciones Estratégicas Respaldadas por Cifras**:
+  1. **Retiro o Auditoría Urgente de `23166` (*MEDIUM CERAMIC TOP STORAGE JAR*)**: Este producto vendió $963.691 pero acumuló reembolsos por **$920.757,60 (95.54% de pérdida directa)**. Al ser un frasco de cerámica con tapa de almacenamiento, una tasa del 95% evidencia roturas sistemáticas durante la manipulación y despacho logístico. Se recomienda detener su distribución de inmediato hasta exigir al proveedor embalaje con burbuja protectora rígida.
+  2. **Investigación de Lotes en `23843` (*PAPER CRAFT , LITTLE BIRDIE*)**: Tuvo **$669.828,65** devueltos (57.19% de sus ventas brutas), indicando problemas de calidad percibida o cancelaciones masivas de pedidos mayoristas.
+  3. **Plan de Acción para la Categoría Electrónica**: Registra una tasa de devolución global del **17.94%** ($1.00M en pérdidas), la más alta de la empresa. Se sugiere implementar un control de calidad pre-despacho y mejorar las guías técnicas del producto para reducir devoluciones por errores de uso.
