@@ -5,6 +5,7 @@ from datetime import datetime, timedelta
 import pandas as pd
 import requests
 from sqlalchemy import create_engine, text
+from psycopg2.extras import execute_values
 
 from airflow import DAG
 from airflow.operators.python import PythonOperator
@@ -42,15 +43,12 @@ def extract_and_unify_sources(**kwargs):
     logger.info(f"Archivos encontrados para procesar: {csv_files}")
 
     column_mapping = {
-        # Formato 1: Sales Transaction v.4a
         'TransactionNo': 'invoice_no',
         'Date': 'invoice_date',
         'ProductNo': 'stock_code',
         'ProductName': 'description',
         'Price': 'unit_price',
         'CustomerNo': 'customer_id',
-        
-        # Formato 2: data.csv (Kaggle diario)
         'InvoiceNo': 'invoice_no',
         'Invoice': 'invoice_no',
         'StockCode': 'stock_code',
@@ -59,8 +57,6 @@ def extract_and_unify_sources(**kwargs):
         'InvoiceDate': 'invoice_date',
         'CustomerID': 'customer_id',
         'Customer ID': 'customer_id',
-        
-        # Comunes
         'Quantity': 'quantity',
         'Country': 'country'
     }
@@ -73,17 +69,14 @@ def extract_and_unify_sources(**kwargs):
         except UnicodeDecodeError:
             df = pd.read_csv(file_path, dtype=str, encoding='ISO-8859-1')
 
-        # Renombrar columnas según el diccionario
         df = df.rename(columns=column_mapping)
         df['source_file'] = os.path.basename(file_path)
         dfs.append(df)
 
-    # 1. Unificar ambas fuentes
     unified_df = pd.concat(dfs, ignore_index=True)
     logger.info(f"Total registros combinados antes de deduplicar: {len(unified_df)}")
 
-    # 2. Manejo de Ambigüedad: Deduplicación por clave compuesta (Sección 5 del PDF)
-    # Si la misma factura, producto, cantidad y precio existen en ambos archivos, se conserva una sola ocurrencia
+    # Deduplicación por clave compuesta para resolver solapamientos
     unified_df = unified_df.drop_duplicates(
         subset=['invoice_no', 'stock_code', 'quantity', 'unit_price'],
         keep='first'
@@ -112,14 +105,14 @@ def fetch_product_catalog(**kwargs):
     kwargs['ti'].xcom_push(key='catalog_map', value=products_map)
 
 # ==============================================================================
-# ETAPA 3: TRANSFORMACIÓN Y APLICACIÓN DE REGLAS DE NEGOCIO
+# ETAPA 3: TRANSFORMACIÓN VECTORIZADA ULTRA-RÁPIDA (PANDAS EN C)
 # ==============================================================================
 def transform_and_validate(**kwargs):
     ti = kwargs['ti']
     unified_path = ti.xcom_pull(task_ids='extract_and_unify_sources', key='unified_data_path')
     df = pd.read_parquet(unified_path)
 
-    # 1. Normalización de códigos de producto (mayúsculas y sin espacios)
+    # 1. Normalización de códigos de producto
     df['stock_code'] = df['stock_code'].astype(str).str.strip().str.upper()
 
     # 2. Parseo numérico
@@ -129,88 +122,80 @@ def transform_and_validate(**kwargs):
     # 3. Estandarización de Fechas a UTC
     df['parsed_date'] = pd.to_datetime(df['invoice_date'], format='mixed', errors='coerce')
     df['parsed_date'] = df['parsed_date'].dt.tz_localize('UTC')
-    df['date_key'] = df['parsed_date'].dt.strftime('%Y%m%d').astype(int)
+    df['date_key'] = df['parsed_date'].dt.strftime('%Y%m%d').astype('Int64')
 
     # 4. Manejo de Clientes Nulos -> INVITADO
     df['customer_id'] = df['customer_id'].fillna('GUEST_USER').astype(str).str.replace(r'\.0$', '', regex=True)
-    df['customer_type'] = df['customer_id'].apply(lambda x: 'INVITADO' if x in ('GUEST_USER', 'nan', '') else 'REGISTRADO')
+    df.loc[df['customer_id'].isin(['nan', 'None', '', 'NULL']), 'customer_id'] = 'GUEST_USER'
+    df['customer_type'] = df['customer_id'].apply(lambda x: 'INVITADO' if x == 'GUEST_USER' else 'REGISTRADO')
 
     # 5. Descripción canónica por producto (Moda estadística)
     canonical_descriptions = df.groupby('stock_code')['description'].agg(
         lambda s: s.dropna().str.strip().str.upper().mode()[0] if not s.dropna().empty else 'SIN DESCRIPCION'
     ).to_dict()
-    df['canonical_description'] = df['stock_code'].map(canonical_descriptions)
+    df['canonical_description'] = df['stock_code'].map(canonical_descriptions).fillna('SIN DESCRIPCION')
 
-    rejections, sales, returns = [], [], []
+    # 6. FILTRADO VECTORIZADO ULTRA-RÁPIDO (En lugar de iterrows)
+    # Máscara 1: Nulos en campos críticos
+    null_mask = df['quantity'].isna() | df['unit_price'].isna() | df['parsed_date'].isna()
 
-    for _, row in df.iterrows():
-        qty = row['quantity']
-        price = row['unit_price']
+    # Máscara 2: Regla de Negocio: UnitPrice <= 0 en venta (Quantity > 0)
+    invalid_price_mask = (~null_mask) & (df['quantity'] > 0) & (df['unit_price'] <= 0)
 
-        # Validación de campos nulos
-        if pd.isna(qty) or pd.isna(price) or pd.isna(row['parsed_date']):
-            rejections.append({
-                'source_file': row['source_file'],
-                'invoice_no': str(row['invoice_no']),
-                'stock_code': row['stock_code'],
-                'rejection_reason': 'VALOR_NULO_EN_CAMPOS_CRITICOS',
-                'raw_record': f'{{"invoice": "{row["invoice_no"]}", "qty": "{qty}", "price": "{price}"}}'
-            })
-            continue
+    # Máscara 3: Devoluciones (Quantity <= 0)
+    returns_mask = (~null_mask) & (~invalid_price_mask) & (df['quantity'] <= 0)
 
-        # Regla: Precios <= 0 en ventas van a rechazos
-        if qty > 0 and price <= 0:
-            rejections.append({
-                'source_file': row['source_file'],
-                'invoice_no': str(row['invoice_no']),
-                'stock_code': row['stock_code'],
-                'rejection_reason': 'PRECIO_INVALIDO_MENOR_IGUAL_CERO',
-                'raw_record': f'{{"invoice": "{row["invoice_no"]}", "price": {price}, "qty": {qty}}}'
-            })
-            continue
+    # Máscara 4: Ventas Válidas (Quantity > 0 y UnitPrice > 0)
+    sales_mask = (~null_mask) & (~invalid_price_mask) & (df['quantity'] > 0)
 
-        # Regla: Cantidad <= 0 es Devolución
-        if qty <= 0:
-            abs_qty = abs(int(qty))
-            returns.append({
-                'invoice_no': str(row['invoice_no']),
-                'stock_code': row['stock_code'],
-                'customer_id': row['customer_id'],
-                'customer_type': row['customer_type'],
-                'canonical_description': row['canonical_description'],
-                'date_key': row['date_key'],
-                'date_full': row['parsed_date'].strftime('%Y-%m-%d'),
-                'return_date_utc': row['parsed_date'].isoformat(),
-                'quantity_returned': abs_qty,
-                'unit_price': float(price),
-                'refund_amount': round(abs_qty * float(price), 4),
-                'country': str(row['country']),
-                'source_file': row['source_file']
-            })
-        else: # Venta normal
-            sales.append({
-                'invoice_no': str(row['invoice_no']),
-                'stock_code': row['stock_code'],
-                'customer_id': row['customer_id'],
-                'customer_type': row['customer_type'],
-                'canonical_description': row['canonical_description'],
-                'date_key': row['date_key'],
-                'date_full': row['parsed_date'].strftime('%Y-%m-%d'),
-                'transaction_date_utc': row['parsed_date'].isoformat(),
-                'quantity': int(qty),
-                'unit_price': float(price),
-                'gross_revenue': round(int(qty) * float(price), 4),
-                'country': str(row['country']),
-                'source_file': row['source_file']
-            })
+    # --- Procesar Ventas Válidas ---
+    sales_df = df[sales_mask].copy()
+    sales_df['quantity'] = sales_df['quantity'].astype(int)
+    sales_df['gross_revenue'] = (sales_df['quantity'] * sales_df['unit_price']).round(4)
+    sales_df['date_full'] = sales_df['parsed_date'].dt.strftime('%Y-%m-%d')
+    sales_df['transaction_date_utc'] = sales_df['parsed_date'].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
 
-    pd.DataFrame(sales).to_parquet('/tmp/clean_sales.parquet', index=False)
-    pd.DataFrame(returns).to_parquet('/tmp/clean_returns.parquet', index=False)
-    pd.DataFrame(rejections).to_parquet('/tmp/clean_rejections.parquet', index=False)
-    logger.info(f"Transformación lista: {len(sales)} ventas, {len(returns)} devoluciones, {len(rejections)} rechazos.")
+    # --- Procesar Devoluciones ---
+    returns_df = df[returns_mask].copy()
+    returns_df['quantity_returned'] = returns_df['quantity'].abs().astype(int)
+    returns_df['refund_amount'] = (returns_df['quantity_returned'] * returns_df['unit_price']).round(4)
+    returns_df['date_full'] = returns_df['parsed_date'].dt.strftime('%Y-%m-%d')
+    returns_df['return_date_utc'] = returns_df['parsed_date'].dt.strftime('%Y-%m-%dT%H:%M:%S%z')
+
+    # --- Procesar Rechazos ---
+    rejections_list = []
+    
+    # Registros con nulos
+    null_df = df[null_mask]
+    for r in null_df[['source_file', 'invoice_no', 'stock_code', 'quantity', 'unit_price']].itertuples(index=False):
+        rejections_list.append({
+            'source_file': str(r.source_file),
+            'invoice_no': str(r.invoice_no),
+            'stock_code': str(r.stock_code),
+            'rejection_reason': 'VALOR_NULO_EN_CAMPOS_CRITICOS',
+            'raw_record': f'{{"invoice": "{r.invoice_no}", "qty": "{r.quantity}", "price": "{r.unit_price}"}}'
+        })
+        
+    # Registros con precios inválidos
+    invalid_p_df = df[invalid_price_mask]
+    for r in invalid_p_df[['source_file', 'invoice_no', 'stock_code', 'quantity', 'unit_price']].itertuples(index=False):
+        rejections_list.append({
+            'source_file': str(r.source_file),
+            'invoice_no': str(r.invoice_no),
+            'stock_code': str(r.stock_code),
+            'rejection_reason': 'PRECIO_INVALIDO_MENOR_IGUAL_CERO',
+            'raw_record': f'{{"invoice": "{r.invoice_no}", "price": {r.unit_price}, "qty": {r.quantity}}}'
+        })
+
+    rejections_df = pd.DataFrame(rejections_list) if rejections_list else pd.DataFrame(columns=['source_file', 'invoice_no', 'stock_code', 'rejection_reason', 'raw_record'])
+
+    sales_df.to_parquet('/tmp/clean_sales.parquet', index=False)
+    returns_df.to_parquet('/tmp/clean_returns.parquet', index=False)
+    rejections_df.to_parquet('/tmp/clean_rejections.parquet', index=False)
+    logger.info(f"Transformación vectorizada lista: {len(sales_df)} ventas, {len(returns_df)} devoluciones, {len(rejections_df)} rechazos.")
 
 # ==============================================================================
-# ETAPA 4: CARGA IDEMPOTENTE AL DATA WAREHOUSE (POSTGRESQL)
+# ETAPA 4: CARGA MASIVA EN LOTES AL DATA WAREHOUSE (POSTGRESQL)
 # ==============================================================================
 def load_to_dwh(**kwargs):
     ti = kwargs['ti']
@@ -222,130 +207,157 @@ def load_to_dwh(**kwargs):
     returns_df = pd.read_parquet('/tmp/clean_returns.parquet')
     rejections_df = pd.read_parquet('/tmp/clean_rejections.parquet')
 
-    with engine.begin() as conn:
-        # 1. Dimensión Fechas
-        dates_all = pd.concat([
-            sales_df[['date_key', 'date_full']],
-            returns_df[['date_key', 'date_full']]
-        ]).drop_duplicates(subset=['date_key'])
+    raw_conn = engine.raw_connection()
+    try:
+        with raw_conn.cursor() as cursor:
+            # 1. Dimensión Fechas (Bulk Insert)
+            logger.info("Cargando dim_date en lotes...")
+            dates_all = pd.concat([
+                sales_df[['date_key', 'date_full']],
+                returns_df[['date_key', 'date_full']]
+            ]).drop_duplicates(subset=['date_key'])
 
-        for _, d in dates_all.iterrows():
-            dt = datetime.strptime(d['date_full'], '%Y-%m-%d')
-            conn.execute(text("""
+            dates_all['dt'] = pd.to_datetime(dates_all['date_full'])
+            date_tuples = [
+                (
+                    int(r.date_key),
+                    r.dt.date(),
+                    int(r.dt.year),
+                    int(r.dt.month),
+                    r.dt.strftime('%B'),
+                    int(r.dt.day),
+                    r.dt.strftime('%A'),
+                    int((r.dt.month - 1) // 3 + 1)
+                )
+                for r in dates_all[['date_key', 'dt']].itertuples(index=False)
+            ]
+            execute_values(cursor, """
                 INSERT INTO datamart_dw.dim_date (date_key, full_date, year, month, month_name, day, day_of_week, quarter)
-                VALUES (:k, :fd, :y, :m, :mn, :d, :dow, :q)
+                VALUES %s
                 ON CONFLICT (date_key) DO NOTHING;
-            """), {
-                'k': int(d['date_key']),
-                'fd': dt.date(),
-                'y': dt.year,
-                'm': dt.month,
-                'mn': dt.strftime('%B'),
-                'd': dt.day,
-                'dow': dt.strftime('%A'),
-                'q': (dt.month - 1) // 3 + 1
-            })
+            """, date_tuples, page_size=5000)
 
-        # 2. Dimensión Clientes
-        cust_all = pd.concat([
-            sales_df[['customer_id', 'country', 'customer_type']],
-            returns_df[['customer_id', 'country', 'customer_type']]
-        ]).drop_duplicates(subset=['customer_id'])
+            # 2. Dimensión Clientes (Bulk Upsert)
+            logger.info("Cargando dim_customers en lotes...")
+            cust_all = pd.concat([
+                sales_df[['customer_id', 'country', 'customer_type']],
+                returns_df[['customer_id', 'country', 'customer_type']]
+            ]).drop_duplicates(subset=['customer_id'])
 
-        for _, c in cust_all.iterrows():
-            conn.execute(text("""
+            cust_tuples = list(cust_all[['customer_id', 'country', 'customer_type']].itertuples(index=False, name=None))
+            execute_values(cursor, """
                 INSERT INTO datamart_dw.dim_customers (customer_id, country, customer_type)
-                VALUES (:cid, :co, :ct)
+                VALUES %s
                 ON CONFLICT (customer_id) DO UPDATE SET country = EXCLUDED.country;
-            """), {'cid': c['customer_id'], 'co': c['country'], 'ct': c['customer_type']})
+            """, cust_tuples, page_size=5000)
 
-        # 3. Dimensión Productos
-        prod_all = pd.concat([
-            sales_df[['stock_code', 'canonical_description']],
-            returns_df[['stock_code', 'canonical_description']]
-        ]).drop_duplicates(subset=['stock_code'])
+            # 3. Dimensión Productos (Bulk Upsert con enriquecimiento API)
+            logger.info("Cargando dim_products en lotes...")
+            prod_all = pd.concat([
+                sales_df[['stock_code', 'canonical_description']],
+                returns_df[['stock_code', 'canonical_description']]
+            ]).drop_duplicates(subset=['stock_code'])
 
-        for _, p in prod_all.iterrows():
-            code = p['stock_code']
-            api_info = catalog_map.get(code, {})
-            category = api_info.get('category', 'Hogar')
-            supplier = api_info.get('supplier_country', 'Colombia')
-            is_active = api_info.get('is_active', True)
+            prod_tuples = []
+            for r in prod_all.itertuples(index=False):
+                code = r.stock_code
+                api_info = catalog_map.get(code, {})
+                category = api_info.get('category', 'Hogar')
+                supplier = api_info.get('supplier_country', 'Colombia')
+                is_active = api_info.get('is_active', True)
+                prod_tuples.append((code, r.canonical_description, category, supplier, is_active))
 
-            conn.execute(text("""
+            execute_values(cursor, """
                 INSERT INTO datamart_dw.dim_products (stock_code, canonical_description, category, supplier_country, is_active)
-                VALUES (:code, :desc, :cat, :sup, :act)
+                VALUES %s
                 ON CONFLICT (stock_code) DO UPDATE 
                 SET canonical_description = EXCLUDED.canonical_description,
                     category = EXCLUDED.category;
-            """), {
-                'code': code,
-                'desc': p['canonical_description'],
-                'cat': category,
-                'sup': supplier,
-                'act': is_active
-            })
+            """, prod_tuples, page_size=5000)
 
-        prod_map = dict(conn.execute(text("SELECT stock_code, product_key FROM datamart_dw.dim_products")).fetchall())
-        cust_map = dict(conn.execute(text("SELECT customer_id, customer_key FROM datamart_dw.dim_customers")).fetchall())
+            # Obtener los IDs generados
+            cursor.execute("SELECT stock_code, product_key FROM datamart_dw.dim_products;")
+            prod_map = dict(cursor.fetchall())
 
-        # 4. Hechos de Ventas (Idempotente)
-        for _, s in sales_df.iterrows():
-            conn.execute(text("""
+            cursor.execute("SELECT customer_id, customer_key FROM datamart_dw.dim_customers;")
+            cust_map = dict(cursor.fetchall())
+
+            guest_cust_key = cust_map.get('GUEST_USER', 1)
+
+            # 4. Carga Masiva de Hechos de Ventas (500.000+ registros en segundos)
+            logger.info(f"Cargando {len(sales_df):,} registros de fact_sales con execute_values...")
+            sales_df['product_key'] = sales_df['stock_code'].map(prod_map).fillna(1).astype(int)
+            sales_df['customer_key'] = sales_df['customer_id'].map(cust_map).fillna(guest_cust_key).astype(int)
+            sales_df['date_key'] = sales_df['date_key'].astype(int)
+            sales_df['quantity'] = sales_df['quantity'].astype(int)
+            sales_df['unit_price'] = sales_df['unit_price'].astype(float)
+            sales_df['gross_revenue'] = sales_df['gross_revenue'].astype(float)
+
+            sales_cols = [
+                'invoice_no', 'product_key', 'customer_key', 'date_key',
+                'transaction_date_utc', 'quantity', 'unit_price', 'gross_revenue',
+                'country', 'source_file'
+            ]
+            sales_tuples = list(sales_df[sales_cols].itertuples(index=False, name=None))
+
+            execute_values(cursor, """
                 INSERT INTO datamart_dw.fact_sales 
                 (invoice_no, product_key, customer_key, date_key, transaction_date_utc, quantity, unit_price, gross_revenue, country, source_file)
-                VALUES (:inv, :pk, :ck, :dk, :dt, :qty, :up, :gr, :cou, :src)
+                VALUES %s
                 ON CONFLICT (invoice_no, product_key, transaction_date_utc, quantity, unit_price) DO NOTHING;
-            """), {
-                'inv': s['invoice_no'],
-                'pk': prod_map[s['stock_code']],
-                'ck': cust_map[s['customer_id']],
-                'dk': int(s['date_key']),
-                'dt': s['transaction_date_utc'],
-                'qty': int(s['quantity']),
-                'up': float(s['unit_price']),
-                'gr': float(s['gross_revenue']),
-                'cou': s['country'],
-                'src': s['source_file']
-            })
+            """, sales_tuples, page_size=5000)
+            logger.info(f"fact_sales cargada exitosamente ({len(sales_tuples):,} registros).")
 
-        # 5. Hechos de Devoluciones (Idempotente)
-        for _, r in returns_df.iterrows():
-            conn.execute(text("""
+            # 5. Carga Masiva de Hechos de Devoluciones
+            logger.info(f"Cargando {len(returns_df):,} registros de fact_returns con execute_values...")
+            returns_df['product_key'] = returns_df['stock_code'].map(prod_map).fillna(1).astype(int)
+            returns_df['customer_key'] = returns_df['customer_id'].map(cust_map).fillna(guest_cust_key).astype(int)
+            returns_df['date_key'] = returns_df['date_key'].astype(int)
+            returns_df['quantity_returned'] = returns_df['quantity_returned'].astype(int)
+            returns_df['unit_price'] = returns_df['unit_price'].astype(float)
+            returns_df['refund_amount'] = returns_df['refund_amount'].astype(float)
+
+            returns_cols = [
+                'invoice_no', 'product_key', 'customer_key', 'date_key',
+                'return_date_utc', 'quantity_returned', 'unit_price', 'refund_amount',
+                'country', 'source_file'
+            ]
+            returns_tuples = list(returns_df[returns_cols].itertuples(index=False, name=None))
+
+            execute_values(cursor, """
                 INSERT INTO datamart_dw.fact_returns 
                 (invoice_no, product_key, customer_key, date_key, return_date_utc, quantity_returned, unit_price, refund_amount, country, source_file)
-                VALUES (:inv, :pk, :ck, :dk, :dt, :qty, :up, :ref, :cou, :src)
+                VALUES %s
                 ON CONFLICT (invoice_no, product_key, return_date_utc, quantity_returned, unit_price) DO NOTHING;
-            """), {
-                'inv': r['invoice_no'],
-                'pk': prod_map[r['stock_code']],
-                'ck': cust_map[r['customer_id']],
-                'dk': int(r['date_key']),
-                'dt': r['return_date_utc'],
-                'qty': int(r['quantity_returned']),
-                'up': float(r['unit_price']),
-                'ref': float(r['refund_amount']),
-                'cou': r['country'],
-                'src': r['source_file']
-            })
+            """, returns_tuples, page_size=5000)
+            logger.info(f"fact_returns cargada exitosamente ({len(returns_tuples):,} registros).")
 
-        # 6. Log de Rechazos
-        for _, rej in rejections_df.iterrows():
-            conn.execute(text("""
-                INSERT INTO datamart_dw.log_rejections (source_file, invoice_no, stock_code, rejection_reason, raw_record)
-                VALUES (:src, :inv, :code, :reason, CAST(:raw AS jsonb))
-            """), {
-                'src': rej['source_file'],
-                'inv': rej['invoice_no'],
-                'code': rej['stock_code'],
-                'reason': rej['rejection_reason'],
-                'raw': str(rej['raw_record'])
-            })
+            # 6. Carga Masiva de Log de Rechazos
+            if len(rejections_df) > 0:
+                logger.info(f"Registrando {len(rejections_df):,} rechazos de calidad...")
+                rej_tuples = [
+                    (
+                        str(r.source_file),
+                        str(r.invoice_no),
+                        str(r.stock_code),
+                        str(r.rejection_reason),
+                        str(r.raw_record)
+                    )
+                    for r in rejections_df.itertuples(index=False)
+                ]
+                execute_values(cursor, """
+                    INSERT INTO datamart_dw.log_rejections (source_file, invoice_no, stock_code, rejection_reason, raw_record)
+                    VALUES %s;
+                """, rej_tuples, template="(%s, %s, %s, %s, CAST(%s AS jsonb))", page_size=5000)
 
-    logger.info("Carga consolidada en DWH completada con éxito.")
+        raw_conn.commit()
+    finally:
+        raw_conn.close()
+
+    logger.info("Carga consolidada en DWH completada con máxima velocidad.")
 
 # ==============================================================================
-# ETAPA 5: CONTROL DE CALIDAD
+# ETAPA 5: CONTROL DE CALIDAD (DATA QUALITY GATES)
 # ==============================================================================
 def run_quality_checks(**kwargs):
     engine = get_dwh_engine()
@@ -357,7 +369,7 @@ def run_quality_checks(**kwargs):
 with DAG(
     'datamart_etl_pipeline',
     default_args=default_args,
-    description='Pipeline ETL DataMart S.A.S. - Múltiples fuentes heterogéneas',
+    description='Pipeline ETL DataMart S.A.S. - Carga masiva optimizada',
     schedule_interval='@daily',
     catchup=False
 ) as dag:

@@ -87,6 +87,12 @@ prueba-DataMart/
 ```
 
 ---
+## Ejecución
+En Windows PowerShell, desde la raíz del proyecto:
+
+```powershell
+.\run_pipeline.ps1
+```
 
 ## Instalación del Entorno Local con `uv` (Desarrollo y VS Code)
 
