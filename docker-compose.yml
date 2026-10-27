@@ -1,22 +1,20 @@
-version: '3.8'
-
 x-airflow-common: &airflow-common
   image: apache/airflow:2.8.1-python3.10
   environment:
     &airflow-common-env
     AIRFLOW__CORE__EXECUTOR: LocalExecutor
-    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER}:${AIRFLOW_DB_PASSWORD}@airflow-postgres:5432/${AIRFLOW_DB_NAME}
+    AIRFLOW__DATABASE__SQL_ALCHEMY_CONN: postgresql+psycopg2://${AIRFLOW_DB_USER:-airflow}:${AIRFLOW_DB_PASSWORD:-airflow}@airflow-postgres:5432/${AIRFLOW_DB_NAME:-airflow_metadata}
     AIRFLOW__CORE__DAGS_ARE_PAUSED_AT_CREATION: 'false'
     AIRFLOW__CORE__LOAD_EXAMPLES: 'false'
     AIRFLOW__API__AUTH_BACKENDS: 'airflow.api.auth.backend.basic_auth,airflow.api.auth.backend.session'
     
-    # Inyección de dependencias necesarias sin compilar Dockerfile
+    # Inyección de dependencias necesarias sin compilar imagen pesada
     _PIP_ADDITIONAL_REQUIREMENTS: "pandas pyarrow psycopg2-binary"
 
     # Conexión automática al DWH PostgreSQL
-    AIRFLOW_CONN_POSTGRES_DWH: postgresql+psycopg2://${DWH_POSTGRES_USER}:${DWH_POSTGRES_PASSWORD}@dwh-postgres:5432/${DWH_POSTGRES_DB}
+    AIRFLOW_CONN_POSTGRES_DWH: postgresql+psycopg2://${DWH_POSTGRES_USER:-dwh_user}:${DWH_POSTGRES_PASSWORD:-dwh_secure_password_2024}@dwh-postgres:5432/${DWH_POSTGRES_DB:-datamart_dwh}
     
-    # Variables de Airflow (incluyendo la URL interna de la API FastAPI)
+    # Variables de Airflow
     AIRFLOW_VAR_RAW_DATA_PATH: /opt/airflow/data
     AIRFLOW_VAR_PRODUCT_API_URL: http://product-api:8000
     AIRFLOW_VAR_BATCH_CHUNK_SIZE: 10000
@@ -32,18 +30,18 @@ x-airflow-common: &airflow-common
       condition: service_healthy
 
 services:
-  # 1. Base de datos de Airflow (Metadatos)
+  # 1. Base de datos de Metadatos de Airflow
   airflow-postgres:
     image: postgres:15-alpine
     container_name: airflow-postgres
     environment:
-      POSTGRES_USER: ${AIRFLOW_DB_USER}
-      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD}
-      POSTGRES_DB: ${AIRFLOW_DB_NAME}
+      POSTGRES_USER: ${AIRFLOW_DB_USER:-airflow}
+      POSTGRES_PASSWORD: ${AIRFLOW_DB_PASSWORD:-airflow}
+      POSTGRES_DB: ${AIRFLOW_DB_NAME:-airflow_metadata}
     volumes:
       - airflow-db-volume:/var/lib/postgresql/data
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER}", "-d", "${AIRFLOW_DB_NAME}"]
+      test: ["CMD", "pg_isready", "-U", "${AIRFLOW_DB_USER:-airflow}", "-d", "${AIRFLOW_DB_NAME:-airflow_metadata}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -54,16 +52,16 @@ services:
     image: postgres:15-alpine
     container_name: dwh-postgres
     environment:
-      POSTGRES_USER: ${DWH_POSTGRES_USER}
-      POSTGRES_PASSWORD: ${DWH_POSTGRES_PASSWORD}
-      POSTGRES_DB: ${DWH_POSTGRES_DB}
+      POSTGRES_USER: ${DWH_POSTGRES_USER:-dwh_user}
+      POSTGRES_PASSWORD: ${DWH_POSTGRES_PASSWORD:-dwh_secure_password_2024}
+      POSTGRES_DB: ${DWH_POSTGRES_DB:-datamart_dwh}
     ports:
-      - "${DWH_POSTGRES_PORT}:5432"
+      - "${DWH_POSTGRES_PORT:-5433}:5432"
     volumes:
       - dwh-db-volume:/var/lib/postgresql/data
       - ./sql/01_init_dwh.sql:/docker-entrypoint-initdb.d/01_init_dwh.sql
     healthcheck:
-      test: ["CMD", "pg_isready", "-U", "${DWH_POSTGRES_USER}", "-d", "${DWH_POSTGRES_DB}"]
+      test: ["CMD", "pg_isready", "-U", "${DWH_POSTGRES_USER:-dwh_user}", "-d", "${DWH_POSTGRES_DB:-datamart_dwh}"]
       interval: 10s
       timeout: 5s
       retries: 5
@@ -71,7 +69,9 @@ services:
 
   # 3. Microservicio API de Catálogo Legado (FastAPI)
   product-api:
-    image: prueba-datamart-product-api:latest
+    build:
+      context: ./api
+      dockerfile: Dockerfile
     container_name: datamart-product-api
     ports:
       - "${PRODUCT_API_PORT:-8000}:8000"
@@ -80,7 +80,7 @@ services:
       - ./data:/data:ro
     restart: always
 
-  # 4. Inicializador de Airflow (Migraciones y usuario admin)
+  # 4. Inicializador de Airflow
   airflow-init:
     <<: *airflow-common
     container_name: airflow-init
@@ -90,12 +90,17 @@ services:
       - |
         airflow db migrate
         airflow users create \
-          --username "${_AIRFLOW_WWW_USER_USERNAME}" \
+          --username "${_AIRFLOW_WWW_USER_USERNAME:-admin}" \
           --firstname DataMart \
           --lastname Admin \
           --role Admin \
           --email admin@datamart.com \
-          --password "${_AIRFLOW_WWW_USER_PASSWORD}" || true
+          --password "${_AIRFLOW_WWW_USER_PASSWORD:-admin}" || true
+        
+        # Inyección automática visual en la UI de Airflow
+        airflow connections add 'POSTGRES_DWH' --conn-type 'postgres' --conn-host 'dwh-postgres' --conn-login "${DWH_POSTGRES_USER:-dwh_user}" --conn-password "${DWH_POSTGRES_PASSWORD:-dwh_secure_password_2024}" --conn-schema "${DWH_POSTGRES_DB:-datamart_dwh}" --conn-port 5432 || true
+        airflow variables set RAW_DATA_PATH /opt/airflow/data || true
+        airflow variables set PRODUCT_API_URL http://product-api:8000 || true
     restart: on-failure
 
   # 5. Webserver de Airflow
