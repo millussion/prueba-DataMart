@@ -1,4 +1,5 @@
 import os
+import glob
 import logging
 from datetime import datetime, timedelta
 import pandas as pd
@@ -20,102 +21,103 @@ default_args = {
     'retry_delay': timedelta(minutes=1),
 }
 
-CSV_FILE_NAME = "Sales Transaction v.4a.csv"
-
 def get_dwh_engine():
     conn = BaseHook.get_connection('POSTGRES_DWH')
     db_url = f"postgresql+psycopg2://{conn.login}:{conn.password}@{conn.host}:{conn.port}/{conn.schema}"
     return create_engine(db_url)
 
 # ==============================================================================
-# ETAPA 1: EXTRACCIÓN EXCLUSIVA DE 'Sales Transaction v.4a.csv'
+# ETAPA 1: EXTRACCIÓN Y UNIFICACIÓN DE MÚLTIPLES DATASETS HETEROGÉNEOS
 # ==============================================================================
-def extract_single_source(**kwargs):
+def extract_and_unify_sources(**kwargs):
     raw_path = Variable.get("RAW_DATA_PATH", default_var="/opt/airflow/data")
-    file_path = os.path.join(raw_path, CSV_FILE_NAME)
+    
+    # Buscar todos los archivos .csv en data/
+    csv_files = glob.glob(os.path.join(raw_path, "*.csv")) + glob.glob(os.path.join(raw_path, "**", "*.csv"))
+    csv_files = list(set(csv_files))
 
-    # Si por alguna razón está dentro de una subcarpeta o con mayúsculas/minúsculas
-    if not os.path.exists(file_path):
-        import glob
-        matches = glob.glob(os.path.join(raw_path, "**", "*Sales Transaction*.csv"), recursive=True)
-        if matches:
-            file_path = matches[0]
-        else:
-            raise FileNotFoundError(f"No se encontró el archivo {CSV_FILE_NAME} en {raw_path}")
+    if not csv_files:
+        raise FileNotFoundError(f"No se encontró ningún archivo CSV en: {raw_path}")
 
-    logger.info(f"Cargando archivo: {file_path}")
+    logger.info(f"Archivos encontrados para procesar: {csv_files}")
 
-    # Soporte para ambas codificaciones habituales
-    try:
-        df = pd.read_csv(file_path, dtype=str, encoding='utf-8')
-    except UnicodeDecodeError:
-        df = pd.read_csv(file_path, dtype=str, encoding='ISO-8859-1')
-
-    # Mapeo universal de columnas según la estructura de Sales Transaction v.4a
     column_mapping = {
+        # Formato 1: Sales Transaction v.4a
         'TransactionNo': 'invoice_no',
+        'Date': 'invoice_date',
+        'ProductNo': 'stock_code',
+        'ProductName': 'description',
+        'Price': 'unit_price',
+        'CustomerNo': 'customer_id',
+        
+        # Formato 2: data.csv (Kaggle diario)
         'InvoiceNo': 'invoice_no',
         'Invoice': 'invoice_no',
-        
-        'ProductNo': 'stock_code',
         'StockCode': 'stock_code',
-        
-        'ProductName': 'description',
         'Description': 'description',
-        
-        'Price': 'unit_price',
         'UnitPrice': 'unit_price',
-        
-        'Quantity': 'quantity',
-        
-        'Date': 'invoice_date',
         'InvoiceDate': 'invoice_date',
-        
-        'CustomerNo': 'customer_id',
         'CustomerID': 'customer_id',
         'Customer ID': 'customer_id',
         
+        # Comunes
+        'Quantity': 'quantity',
         'Country': 'country'
     }
-    df = df.rename(columns=column_mapping)
-    df['source_file'] = CSV_FILE_NAME
 
-    # Deduplicación inicial de filas exactamente repetidas
-    df = df.drop_duplicates()
+    dfs = []
+    for file_path in csv_files:
+        logger.info(f"Leyendo fuente: {file_path}")
+        try:
+            df = pd.read_csv(file_path, dtype=str, encoding='utf-8')
+        except UnicodeDecodeError:
+            df = pd.read_csv(file_path, dtype=str, encoding='ISO-8859-1')
 
-    tmp_path = "/tmp/raw_transactions.parquet"
-    df.to_parquet(tmp_path, index=False)
-    kwargs['ti'].xcom_push(key='raw_data_path', value=tmp_path)
-    logger.info(f"Registros extraídos correctamente: {len(df)}")
+        # Renombrar columnas según el diccionario
+        df = df.rename(columns=column_mapping)
+        df['source_file'] = os.path.basename(file_path)
+        dfs.append(df)
+
+    # 1. Unificar ambas fuentes
+    unified_df = pd.concat(dfs, ignore_index=True)
+    logger.info(f"Total registros combinados antes de deduplicar: {len(unified_df)}")
+
+    # 2. Manejo de Ambigüedad: Deduplicación por clave compuesta (Sección 5 del PDF)
+    # Si la misma factura, producto, cantidad y precio existen en ambos archivos, se conserva una sola ocurrencia
+    unified_df = unified_df.drop_duplicates(
+        subset=['invoice_no', 'stock_code', 'quantity', 'unit_price'],
+        keep='first'
+    )
+    logger.info(f"Total registros únicos tras resolver solapamientos: {len(unified_df)}")
+
+    tmp_path = "/tmp/unified_transactions.parquet"
+    unified_df.to_parquet(tmp_path, index=False)
+    kwargs['ti'].xcom_push(key='unified_data_path', value=tmp_path)
 
 # ==============================================================================
 # ETAPA 2: CONSULTA AL CATÁLOGO DE PRODUCTOS (API FASTAPI)
 # ==============================================================================
-# Reemplazar la función fetch_product_catalog en dags/datamart_etl_pipeline.py:
 def fetch_product_catalog(**kwargs):
-    logger.info("Cargando catálogo estático interno de DataMart (Estrategia Sección 4.3)...")
+    api_url = Variable.get("PRODUCT_API_URL", default_var="http://product-api:8000")
+    products_map = {}
+    try:
+        response = requests.get(f"{api_url}/products?page=1&page_size=500", timeout=5)
+        if response.status_code == 200:
+            for item in response.json():
+                products_map[item['code'].strip().upper()] = item
+            logger.info(f"Se obtuvieron {len(products_map)} productos desde el catálogo API.")
+    except Exception as e:
+        logger.warning(f"Aviso: Fallback en catálogo ({e})")
     
-    # Catálogo precargado con las categorías oficiales de DataMart
-    catalog_map = {
-        "85123A": {"category": "Hogar", "supplier_country": "Colombia"},
-        "71053":  {"category": "Hogar", "supplier_country": "Colombia"},
-        "84406B": {"category": "Hogar", "supplier_country": "México"},
-        "84029G": {"category": "Ropa", "supplier_country": "Perú"},
-        "84029E": {"category": "Ropa", "supplier_country": "Perú"},
-        "22752":  {"category": "Papelería", "supplier_country": "Colombia"},
-        "21730":  {"category": "Hogar", "supplier_country": "México"},
-        "22633":  {"category": "Electrónica", "supplier_country": "Colombia"},
-        "22632":  {"category": "Deportes", "supplier_country": "Perú"},
-    }
-    kwargs['ti'].xcom_push(key='catalog_map', value=catalog_map)
+    kwargs['ti'].xcom_push(key='catalog_map', value=products_map)
 
 # ==============================================================================
 # ETAPA 3: TRANSFORMACIÓN Y APLICACIÓN DE REGLAS DE NEGOCIO
 # ==============================================================================
 def transform_and_validate(**kwargs):
     ti = kwargs['ti']
-    raw_path = ti.xcom_pull(task_ids='extract_single_source', key='raw_data_path')
-    df = pd.read_parquet(raw_path)
+    unified_path = ti.xcom_pull(task_ids='extract_and_unify_sources', key='unified_data_path')
+    df = pd.read_parquet(unified_path)
 
     # 1. Normalización de códigos de producto (mayúsculas y sin espacios)
     df['stock_code'] = df['stock_code'].astype(str).str.strip().str.upper()
@@ -156,7 +158,7 @@ def transform_and_validate(**kwargs):
             })
             continue
 
-        # Regla de Negocio: Precios <= 0 en ventas van a rechazos
+        # Regla: Precios <= 0 en ventas van a rechazos
         if qty > 0 and price <= 0:
             rejections.append({
                 'source_file': row['source_file'],
@@ -167,7 +169,7 @@ def transform_and_validate(**kwargs):
             })
             continue
 
-        # Regla de Negocio: Cantidad <= 0 es Devolución
+        # Regla: Cantidad <= 0 es Devolución
         if qty <= 0:
             abs_qty = abs(int(qty))
             returns.append({
@@ -331,36 +333,36 @@ def load_to_dwh(**kwargs):
         for _, rej in rejections_df.iterrows():
             conn.execute(text("""
                 INSERT INTO datamart_dw.log_rejections (source_file, invoice_no, stock_code, rejection_reason, raw_record)
-                VALUES (:src, :inv, :code, :reason, :raw::jsonb)
+                VALUES (:src, :inv, :code, :reason, CAST(:raw AS jsonb))
             """), {
                 'src': rej['source_file'],
                 'inv': rej['invoice_no'],
                 'code': rej['stock_code'],
                 'reason': rej['rejection_reason'],
-                'raw': rej['raw_record']
+                'raw': str(rej['raw_record'])
             })
 
-    logger.info("Carga en DWH completada exitosamente.")
+    logger.info("Carga consolidada en DWH completada con éxito.")
 
 # ==============================================================================
-# ETAPA 5: CONTROL DE CALIDAD (DATA QUALITY GATES)
+# ETAPA 5: CONTROL DE CALIDAD
 # ==============================================================================
 def run_quality_checks(**kwargs):
     engine = get_dwh_engine()
     with engine.connect() as conn:
         invalid_prices = conn.execute(text("SELECT COUNT(*) FROM datamart_dw.fact_sales WHERE unit_price <= 0")).scalar()
-        assert invalid_prices == 0, f"Error: {invalid_prices} ventas con precios <= 0 en fact_sales"
+        assert invalid_prices == 0, f"Error: {invalid_prices} ventas con precios <= 0"
         logger.info("Quality checks aprobados al 100%.")
 
 with DAG(
     'datamart_etl_pipeline',
     default_args=default_args,
-    description='Pipeline ETL DataMart S.A.S. - Fuente: Sales Transaction v.4a.csv',
+    description='Pipeline ETL DataMart S.A.S. - Múltiples fuentes heterogéneas',
     schedule_interval='@daily',
     catchup=False
 ) as dag:
 
-    t1 = PythonOperator(task_id='extract_single_source', python_callable=extract_single_source)
+    t1 = PythonOperator(task_id='extract_and_unify_sources', python_callable=extract_and_unify_sources)
     t2 = PythonOperator(task_id='fetch_product_catalog', python_callable=fetch_product_catalog)
     t3 = PythonOperator(task_id='transform_and_validate', python_callable=transform_and_validate)
     t4 = PythonOperator(task_id='load_to_dwh', python_callable=load_to_dwh)
